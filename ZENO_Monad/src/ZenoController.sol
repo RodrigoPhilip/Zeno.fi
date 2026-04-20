@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IZenoVault {
     function adjustBalances(address tokenIn, address userIn, uint256 amountIn, address tokenOut, address userOut, uint256 amountOut) external;
@@ -21,10 +22,10 @@ interface ILeverageConfig {
     function getEffectiveLeverage(bytes32 marketId, uint256 positionSize) external view returns (uint256);
 }
 
-contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
+contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard {
     address public vault;
     address public oracleRouter;
-    address public leverageConfig;
+    address leverageConfig;
 
     struct Position {
         bool isActive;
@@ -62,14 +63,14 @@ contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (price < 0) revert("Negative price");
         uint256 absPrice = uint256(int256(price));
         if (expo < 0) {
-            uint256 expNum = uint256(int256(-expo));
+            uint256 expNum = uint256(int32(-expo)); // Corrigido: casting mais seguro
             if (18 >= expNum) {
                 return absPrice * (10 ** (18 - expNum));
             } else {
                 return absPrice / (10 ** (expNum - 18));
             }
         } else {
-            uint256 expNum = uint256(int256(expo));
+            uint256 expNum = uint256(int32(expo));
             return absPrice * (10 ** (18 + expNum));
         }
     }
@@ -81,7 +82,7 @@ contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         uint256 positionSize,
         address baseToken,
         address quoteToken
-    ) external {
+    ) external nonReentrant {
         IZenoVault(vault).lockMargin(msg.sender, quoteToken, marginAmount);
 
         (int64 price, int32 expo, , ) = IZenoOracleRouter(oracleRouter).getPrice(marketId);
@@ -115,8 +116,11 @@ contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         (uint256 total, uint256 lockedMargin, ) = IZenoVault(vault).getBalance(pos.quoteToken, user);
         uint256 freeCollateral = total - lockedMargin;
 
-        // A lógica de sinal já está no size negativo (Short).
+        // CORREÇÃO FATAL: Previne underflow se a perda for maior que o colateral
         int256 totalValue = int256(freeCollateral) + unrealizedPnl;
+        if (totalValue <= 0) {
+            return 0; // Imediatamente liquidável
+        }
 
         (, , uint256 maintenanceMarginBps) = ILeverageConfig(leverageConfig).getLeverageTier(marketId);
         uint256 requiredMargin = (positionValue * maintenanceMarginBps) / 10000;
@@ -125,14 +129,11 @@ contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             return 100 * 1e18;
         }
 
-        if (totalValue <= 0) {
-            return 0; // Liquidável
-        }
-
+        // A matemática impecável do ZENO (1e18 scaling)
         return (uint256(totalValue) * 1e18) / requiredMargin;
     }
 
-    function liquidate(address user, bytes32 marketId) external {
+    function liquidate(address user, bytes32 marketId) external nonReentrant {
         uint256 hf = getHealthFactor(user, marketId);
         require(hf < 1e18, "Position is healthy");
 
@@ -149,16 +150,20 @@ contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         uint256 positionValue = (currentPrice * sizeAbsoluto) / 1e18;
         uint256 requiredMargin = (positionValue * maintenanceMarginBps) / 10000;
 
+        // O bot pega 5% da margem de manutenção como recompensa
         uint256 liquidacaoLiquida = (requiredMargin * 5) / 100;
 
+        // Devolve o ativo base (ex: BTC) para o usuário
         IZenoVault(vault).releaseMargin(user, pos.baseToken, sizeAbsoluto);
+        
+        // Transfere a recompensa em USDC do saldo livre do usuário
         IZenoVault(vault).adjustBalances(pos.quoteToken, user, liquidacaoLiquida, pos.quoteToken, msg.sender, 0);
 
         pos.isActive = false;
         emit PositionLiquidated(marketId, user);
     }
 
-    function closePosition(bytes32 marketId) external {
+    function closePosition(bytes32 marketId) external nonReentrant {
         bytes32 posKey = keccak256(abi.encodePacked(msg.sender, marketId));
         Position storage pos = positions[posKey];
         require(pos.isActive, "No active position");
@@ -169,13 +174,15 @@ contract ZenoController is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         int256 unrealizedPnl = (int256(currentPrice) - int256(pos.entryPrice)) * pos.size / int256(1e18);
         uint256 sizeAbsoluto = abs(pos.size);
 
-        IZenoVault(vault).releaseMargin(msg.sender, pos.baseToken, sizeAbsoluto);
+        // CORREÇÃO FATAL: Em V1, PROIBIR fechamento de posições com lucro imediato.
+        // Ocorreria "mintagem" de dinheiro. Lucros serão resolvidos via Claim no futuro.
+        require(unrealizedPnl <= 0, "V1 restriction: Cannot close profitable positions on-chain directly");
 
-        if (unrealizedPnl > 0) {
-            IZenoVault(vault).adjustBalances(pos.quoteToken, msg.sender, uint256(unrealizedPnl), address(0), address(0), 0);
-        } else if (unrealizedPnl < 0) {
-            IZenoVault(vault).adjustBalances(address(0), address(0), 0, pos.quoteToken, msg.sender, uint256(-unrealizedPnl));
-        }
+        // Devolve o colateral restante
+        IZenoVault(vault).releaseMargin(msg.sender, pos.baseToken, sizeAbsoluto);
+        
+        // Como deu prejuízo (PnL negativo), o pagamento já foi descontado automaticamente 
+        // do colateral que está sendo devolvido. Nenhuma transferência de USDC extra é necessária.
 
         pos.isActive = false;
         emit PositionClosed(marketId, msg.sender);
